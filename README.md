@@ -72,3 +72,7 @@ asks the node to also pass along packets addressed to other nodes that it overhe
 This needs a custom firmware module that listens on private port 300. It isn't part of standard
 Meshtastic firmware, and with standard firmware the command has no effect. `meshlisten` turns sniff mode
 off again when it quits.
+
+## License
+
+[GNU Affero General Public License v3.0](LICENSE)
