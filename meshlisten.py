@@ -1,6 +1,7 @@
 from meshtastic.serial_interface import SerialInterface
+from meshtastic.tcp_interface import TCPInterface
 import meshtastic
-from meshtastic.protobuf import mesh_pb2, portnums_pb2, localonly_pb2
+from meshtastic.protobuf import admin_pb2, mesh_pb2, portnums_pb2, localonly_pb2
 from pubsub import pub
 from datetime import datetime
 from sys import exit, stderr
@@ -16,7 +17,12 @@ import threading
 from prompt_toolkit import patch_stdout, PromptSession
 
 debug_enabled:bool = False
-waiting_for_config:bool = False
+quiet:bool = False  # stop printing received packets (they are still stored)
+log_admin:bool = False  # store ADMIN_APP packets, which can contain keys, passwords and session passkeys
+config_request:dict|None = None  # {"pending": set of config sections still to print, "unredacted": bool}
+# fields hidden by the c command unless "c unredacted" is used
+REDACTED_CONFIG_FIELDS = {"security": ["private_key"], "network": ["wifi_psk"], "bluetooth": ["fixed_pin"]}
+REDACTED_NODE_FIELDS = ["position", "adminSessionPassKey"]
 MESSAGE_RX_SUBSCRIPTION = "meshtastic.receive"
 SNIFF_PORTNUM = portnums_pb2.PortNum.ValueType(300)  # private port handled by the custom firmware SniffModule
 sniff_requested:bool = False
@@ -32,7 +38,7 @@ CREATE TABLE IF NOT EXISTS packets (
     to_node INTEGER,
     portnum TEXT,               -- e.g. TEXT_MESSAGE_APP, or the number for private ports; NULL if still encrypted
     packet_id INTEGER,          -- MeshPacket.id, for matching replies and duplicates
-    port TEXT,                  -- serial device the packet arrived on
+    port TEXT,                  -- serial device or host the packet arrived through
     local_node INTEGER,         -- node number of the connected device
     packet_json TEXT NOT NULL,  -- packet dict as JSON (bytes base64-encoded, protobuf "raw" objects omitted)
     packet_raw BLOB             -- serialized MeshPacket protobuf, exactly as received
@@ -68,11 +74,21 @@ class ANSIColor:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--port", required=True, action="store", type=str, help="Serial port to use for device communication")
+    connection = parser.add_mutually_exclusive_group()
+    connection.add_argument("-p", "--port", action="store", type=str, help="Serial port to use for device communication")
+    connection.add_argument("--host", action="store", type=str, help="Hostname or IP address of a node on Wi-Fi (TCP port 4403)")
     parser.add_argument("--debug", action="store_true", default=False, help="Enables printing additional debugging messages (such as full tx and rx packets)")
+    parser.add_argument("--quiet", action="store_true", default=False, help="Don't print received packets as they arrive (they are still stored)")
     parser.add_argument("--hops", action="store", type=int, default=3, help="Specifies the default hop limit when sending messages")
     parser.add_argument("--db", action="store", type=str, default=DEFAULT_DB_PATH, help="SQLite database file for the received packet history")
-    return parser.parse_args()
+    parser.add_argument("--log-admin", action="store_true", default=False,
+                        help="Also store ADMIN_APP packets. These include config replies with the node's private key, Wi-Fi password and admin session passkeys")
+    parser.add_argument("--purge-admin", action="store_true", default=False,
+                        help="Delete stored ADMIN_APP packets and compact the database. Without --port or --host, exit afterwards")
+    args = parser.parse_args()
+    if not (args.port or args.host or args.purge_admin):
+        parser.error("one of the arguments -p/--port --host is required")
+    return args
 
 def node_name(interface, num):
     """Turn a numeric node ID into !deadbeef + friendly name if known."""
@@ -164,6 +180,13 @@ def open_db(path:str)->sqlite3.Connection:
     conn.executescript(DB_SCHEMA)
     return conn
 
+def purge_admin_packets(conn:sqlite3.Connection)->int:
+    """Delete stored ADMIN_APP packets, then VACUUM so the deleted data is gone from the file too"""
+    with db_lock:
+        removed = conn.execute("DELETE FROM packets WHERE portnum = 'ADMIN_APP'").rowcount
+        conn.execute("VACUUM")
+    return removed
+
 def json_safe(value):
     """Copy of a packet dict that json can serialize"""
     if isinstance(value, dict):
@@ -178,6 +201,8 @@ def json_safe(value):
 
 def store_packet(time:datetime, interface, packet:dict)->None:
     portnum = packet.get("decoded", {}).get("portnum")
+    if portnum == "ADMIN_APP" and not log_admin:
+        return  # config replies carry secrets, only kept with --log-admin
     raw = packet.get("raw")
     row = (
         time.timestamp(),
@@ -185,7 +210,7 @@ def store_packet(time:datetime, interface, packet:dict)->None:
         packet.get("to"),
         None if portnum is None else str(portnum),
         packet.get("id"),
-        getattr(interface, "devPath", None),
+        getattr(interface, "devPath", None) or getattr(interface, "hostname", None),
         interface.localNode.nodeNum if interface.localNode else None,
         json.dumps(json_safe(packet), ensure_ascii=False),
         raw.SerializeToString() if raw is not None else None,
@@ -213,7 +238,8 @@ def on_receive(packet, interface):
     if decoded.get("portnum") == "ADMIN_APP":
         handle_admin_packet(packet, interface)
     dbg(packet)
-    print_message(rx_time, interface, packet)
+    if not quiet:
+        print_message(rx_time, interface, packet)
 
 def node_num_arg(value:str)->int:
     """argparse type for node IDs: !xxxxxxxx or a broadcast alias"""
@@ -384,27 +410,92 @@ def show_packet(interface, margs:argparse.Namespace)->None:
             print(mesh_pb2.MeshPacket.FromString(packet_raw))
 
 def handle_admin_packet(packet, interface):
-      global waiting_for_config
-      if packet.get("from") != interface.localNode.nodeNum:
-          # only a reply from our own node describes localConfig
-          return
-      admin = packet["decoded"]["admin"]["raw"]
-      if admin.HasField("get_config_response"):
-          cfg = admin.get_config_response
-          section = cfg.WhichOneof("payload_variant")
-          getattr(interface.localNode.localConfig, section).CopyFrom(getattr(cfg, section))
-          if waiting_for_config:
-              waiting_for_config = False
-              print_config(interface)
+    global config_request
+    if packet.get("from") != interface.localNode.nodeNum:
+        # only a reply from our own node describes localConfig
+        return
+    admin = packet["decoded"]["admin"]["raw"]
+    if admin.HasField("get_config_response"):
+        cfg = admin.get_config_response
+        section = cfg.WhichOneof("payload_variant")
+        getattr(interface.localNode.localConfig, section).CopyFrom(getattr(cfg, section))
+        request = config_request
+        if request is not None and section in request["pending"]:
+            print_config_section(section, getattr(cfg, section), request["unredacted"])
+            request["pending"].discard(section)
+            if not request["pending"]:
+                config_request = None
+    elif admin.HasField("get_device_connection_status_response"):
+        print_connection_status(interface, admin.get_device_connection_status_response)
 
-def print_config(interface):
+def request_connection_status(interface)->None:
+    p = admin_pb2.AdminMessage()
+    p.get_device_connection_status_request = True
+    # the library has no public helper for this request, getMetadata() uses _sendAdmin the same way
+    interface.localNode._sendAdmin(p, wantResponse=True)
+
+def format_ip(ip:int)->str:
+    # the firmware stores the address with the first octet in the low byte
+    return ".".join(str((ip >> shift) & 0xFF) for shift in (0, 8, 16, 24))
+
+def print_connection_status(interface, conn)->None:
+    if conn.HasField("wifi"):
+        wifi = conn.wifi
+        if wifi.status.is_connected:
+            print(f'wifi: connected to "{wifi.ssid}", {format_ip(wifi.status.ip_address)}, RSSI {wifi.rssi} dBm')
+        else:
+            enabled = interface.localNode.localConfig.network.wifi_enabled
+            network = f'network "{wifi.ssid}"' if wifi.ssid else "no network set"
+            print(f"wifi: not connected ({'enabled' if enabled else 'disabled'} in config, {network})")
+    else:
+        print("wifi: not in this firmware")
+    if conn.HasField("ethernet"):
+        eth = conn.ethernet.status
+        print(f"ethernet: connected, {format_ip(eth.ip_address)}" if eth.is_connected else "ethernet: not connected")
+    if conn.HasField("bluetooth"):
+        print(f"bluetooth: {'connected' if conn.bluetooth.is_connected else 'not connected'}")
+    else:
+        print("bluetooth: not in this firmware")
+    if conn.HasField("serial"):
+        print(f"serial: {'connected' if conn.serial.is_connected else 'not connected'}, {conn.serial.baud} baud")
+
+def request_config(interface, unredacted:bool)->None:
+    """Print local info now, then ask the node for every config section (printed as the replies arrive)"""
+    global config_request
     print(interface.myInfo)
-    print(interface.getMyNodeInfo())
-    print(interface.localNode.localConfig)
+    node = dict(interface.getMyNodeInfo() or {})
+    if not unredacted:
+        for field in REDACTED_NODE_FIELDS:
+            if field in node:
+                node[field] = "<redacted>"
+    print(node)
+
+    sections = [f for f in localonly_pb2.LocalConfig.DESCRIPTOR.fields if f.name != "version"]  # version can't be requested
+    config_request = {"pending": {f.name for f in sections}, "unredacted": unredacted}
+    print(f"requesting {len(sections)} config sections...")
+    for field in sections:
+        interface.localNode.requestConfig(field)
+
+def print_config_section(section:str, values, unredacted:bool)->None:
+    hidden = []
+    if not unredacted:
+        copy = type(values)()
+        copy.CopyFrom(values)
+        for field in REDACTED_CONFIG_FIELDS.get(section, []):
+            if copy.HasField(field) if copy.DESCRIPTOR.fields_by_name[field].has_presence else getattr(copy, field):
+                copy.ClearField(field)
+                hidden.append(field)
+        values = copy
+    print(f"{section}:")
+    for line in str(values).splitlines():
+        print(f"  {line}")
+    if hidden:
+        print(f"  ({', '.join(hidden)} redacted, use \"c unredacted\" to show)")
 
 def print_help():
     print("h help - prints this help")
-    print("c config - prints local device config")
+    print("status - shows the node's wifi, bluetooth and serial connection status")
+    print("c config [unredacted] - prints local device config (keys, passwords and position hidden unless unredacted)")
     print("n nodes [node_id] - list nodes or shows node details")
     print("q quit - quits")
     print("t traceroute <node_id> - sends traceroute message to node")
@@ -412,6 +503,7 @@ def print_help():
     print("s send <node_id> <message> - sends text message to node")
     print("r request <node_id> - sends info request to node")
     print("d debug [on|off] - extra debugging messages (including sent and received packets)")
+    print("quiet [on|off] - stops printing received packets as they arrive (they are still stored)")
     print()
     print("hops [hop_count] - sets the message hop limit to specify when sending")
     print("sniff [on|off] - receive and report packets that are addressed to other nodes")
@@ -467,9 +559,11 @@ def dbg(msg:Any)->None:
     print(f"{ANSIColor.YELLOW}{msg}{ANSIColor.END}")
 
 def main(args: argparse.Namespace)->int:
-    global debug_enabled, waiting_for_config, sniff_requested, db
+    global debug_enabled, quiet, log_admin, sniff_requested, db
 
     debug_enabled = args.debug
+    quiet = args.quiet
+    log_admin = args.log_admin
 
     try:
         db = open_db(args.db)
@@ -477,6 +571,17 @@ def main(args: argparse.Namespace)->int:
         print(f"Can't open database {args.db}: {ex}", file=stderr)
         return 1
     dbg(f"Storing packets in {args.db}")
+
+    if args.purge_admin:
+        try:
+            removed = purge_admin_packets(db)
+        except sqlite3.Error as ex:
+            print(f"Purging admin packets failed: {ex}", file=stderr)
+            return 1
+        print(f"Removed {removed} admin packets from {args.db}")
+        if not (args.port or args.host):
+            db.close()
+            return 0
 
     prompt_session = PromptSession()
     messages_parser = build_messages_parser()
@@ -486,15 +591,23 @@ def main(args: argparse.Namespace)->int:
 
     hop_limit:int = args.hops
 
-    dbg(f"Connecting to {args.port}")
+    target = args.host or args.port
+    dbg(f"Connecting to {target}")
 
     try:
-        interface = SerialInterface(args.port)
+        if args.host:
+            interface = TCPInterface(args.host)
+        else:
+            interface = SerialInterface(args.port)
     except FileNotFoundError as ex:
         print(f"{args.port} not found on this system ({ex})", file=stderr)
         return 1
+    except OSError as ex:
+        # TCP: refused, unreachable, unknown host
+        print(f"failed to connect to {target} ({ex})", file=stderr)
+        return 1
     except meshtastic.mesh_interface.MeshInterface.MeshInterfaceError:
-        print(f"failed to connect to {args.port}, the device may be shut down", file=stderr)
+        print(f"failed to connect to {target}, the device may be shut down", file=stderr)
         return 1
 
     with interface:
@@ -532,10 +645,12 @@ def main(args: argparse.Namespace)->int:
             elif cmd in ("q", "exit", "quit"):
                 break
             elif cmd in ("c", "settings", "config"):
-                field = localonly_pb2.LocalConfig.DESCRIPTOR.fields_by_name["position"]
-                print("getting settings, please wait...")
-                waiting_for_config = True
-                interface.localNode.requestConfig(field)
+                if len(cmdargs) > 0 and cmdargs[0].lower() != "unredacted":
+                    print("usage: c [unredacted]")
+                    continue
+                request_config(interface, unredacted=len(cmdargs) > 0)
+            elif cmd == "status":
+                request_connection_status(interface)
             elif cmd in ("t", "traceroute", "tracert", "trace"):
                 if len(cmdargs) == 0:
                     print("must provide a node ID in the format !xxxxxxxx")
@@ -605,6 +720,19 @@ def main(args: argparse.Namespace)->int:
                 elif cmdargs[0].lower() in ("disabled", "off", "false", "disable", "0", "n", "no"):
                     debug_enabled = False
                     print("debug printing disabled")
+                else:
+                    print("invalid argument")
+                    continue
+            elif cmd == "quiet":
+                if len(cmdargs) == 0:
+                    print(f"Quiet mode: {"enabled" if quiet else "disabled"}")
+                    continue
+                if cmdargs[0].lower() in ("enabled", "on", "true", "enable", "1", "y", "yes"):
+                    quiet = True
+                    print("quiet mode enabled, received packets are stored but not printed")
+                elif cmdargs[0].lower() in ("disabled", "off", "false", "disable", "0", "n", "no"):
+                    quiet = False
+                    print("quiet mode disabled")
                 else:
                     print("invalid argument")
                     continue
