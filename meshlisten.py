@@ -16,6 +16,7 @@ import os
 import shlex
 import sqlite3
 import threading
+import time
 from prompt_toolkit import patch_stdout, PromptSession
 
 debug_enabled:bool = False
@@ -526,6 +527,7 @@ def print_help():
     print()
     print("hops [hop_count] - sets the message hop limit to specify when sending")
     print("sniff [on|off] - receive and report packets that are addressed to other nodes")
+    print("reconnect - reconnects to the node (after it gave up because another client kept taking over)")
     print("reboot - reboots the node")
     print("shutdown - shuts down the node and quits")
     print()
@@ -607,6 +609,10 @@ def open_interface(args:argparse.Namespace):
         return TCPInterface(args.host)
     return SerialInterface(args.port)
 
+# losing the connection this often means another client keeps taking it over (a node allows one Wi-Fi client)
+DROP_LIMIT = 3
+DROP_WINDOW_SECS = 60
+
 class Connection:
     """Holds the current interface and replaces it when the library reports the connection lost"""
 
@@ -615,24 +621,53 @@ class Connection:
         self.interface = interface
         self.closing = False
         self.reconnecting = False
+        self.stopped = False  # gave up after repeated drops, until the reconnect command
+        self.drop_times:list[float] = []
         self.lock = threading.Lock()
         self.reboot_count = interface.myInfo.reboot_count if interface.myInfo else None
         pub.subscribe(self.on_connection_lost, "meshtastic.connection.lost")
 
     @property
     def connected(self)->bool:
-        return not self.reconnecting and self.interface.isConnected.is_set()
+        return not self.reconnecting and not self.stopped and self.interface.isConnected.is_set()
 
     def on_connection_lost(self, interface):
+        target = self.args.host or self.args.port
         with self.lock:
-            if self.closing or self.reconnecting or interface is not self.interface:
+            if self.closing or self.reconnecting or self.stopped or interface is not self.interface:
                 return
-            self.reconnecting = True
+            now = time.time()
+            self.drop_times = [t for t in self.drop_times if now - t < DROP_WINDOW_SECS] + [now]
+            if len(self.drop_times) >= DROP_LIMIT:
+                self.stopped = True
+            else:
+                self.reconnecting = True
+        if self.stopped:
+            log_event(f"Connection to {target} lost {DROP_LIMIT} times within {DROP_WINDOW_SECS}s. Another client is probably "
+                      f"connected to this node (it allows only one Wi-Fi client). Not reconnecting, use the reconnect command to try again.")
+            with contextlib.suppress(Exception):
+                interface.close()  # stops its heartbeat timer
+            return
+        log_event(f"Connection to {target} lost, reconnecting...")
         threading.Thread(target=self._reconnect, args=(interface,), daemon=True).start()
+
+    def reconnect(self)->None:
+        """Manual reconnect, e.g. after giving up because another client kept taking over"""
+        with self.lock:
+            if self.reconnecting:
+                print("Already reconnecting")
+                return
+            if self.connected:
+                print("Already connected")
+                return
+            self.stopped = False
+            self.drop_times.clear()
+            self.reconnecting = True
+        log_event(f"Reconnecting to {self.args.host or self.args.port}...")
+        threading.Thread(target=self._reconnect, args=(self.interface,), daemon=True).start()
 
     def _reconnect(self, old):
         target = self.args.host or self.args.port
-        log_event(f"Connection to {target} lost, reconnecting...")
         # closing the dead interface also stops its heartbeat timer
         with contextlib.suppress(Exception):
             old.close()
@@ -748,7 +783,10 @@ def main(args: argparse.Namespace)->int:
 
             interface = conn.interface  # may have been replaced by a reconnect
             if cmd in NODE_COMMANDS and not conn.connected:
-                print("Not connected to the node right now (reconnecting), try again shortly")
+                if conn.reconnecting:
+                    print("Not connected to the node right now (reconnecting), try again shortly")
+                else:
+                    print("Not connected to the node, use the reconnect command")
                 continue
 
             if cmd in ("n", "nodes"):
@@ -765,6 +803,8 @@ def main(args: argparse.Namespace)->int:
                     print("usage: c [unredacted]")
                     continue
                 request_config(interface, unredacted=len(cmdargs) > 0)
+            elif cmd == "reconnect":
+                conn.reconnect()
             elif cmd == "status":
                 request_status(interface)
             elif cmd in ("t", "traceroute", "tracert", "trace"):

@@ -36,8 +36,21 @@ On macOS, the first `--host` connection may fail with "No route to host" while m
 terminal app may access devices on the local network. Allow it and run the command again. The setting is in
 System Settings → Privacy & Security → Local Network.
 
-Running one instance per node is fine. They can share the same database, and each packet records which
-node received it.
+### One client per node
+
+Run one instance for each node. Several instances can share the same database, and each packet records
+which node received it. A node shouldn't have more than one client at a time, though:
+
+- **A node accepts only one Wi-Fi client.** A new connection closes the previous one, and that includes
+  the Meshtastic app over Wi-Fi. `meshlisten` reconnects automatically when its connection is lost, but if
+  that happens 3 times within a minute it assumes another client keeps taking over, stops, and waits for
+  the `reconnect` command.
+- **Don't use Wi-Fi and USB serial to the same node at once.** Both clients take received packets from
+  the same queue on the node, so each packet goes to only one of them. Replies to commands such as `c` or
+  `status` can end up at the other client too.
+
+If the connection drops and comes back, `meshlisten` says whether the node rebooted and turns sniff mode
+back on if it was in use. Connection events and errors are printed with timestamps.
 
 ## Commands
 
@@ -55,6 +68,7 @@ node received it.
 | `d`, `debug [on\|off]` | Show or toggle debug output |
 | `quiet [on\|off]` | Show or toggle printing of received packets (they are still stored) |
 | `sniff [on\|off]` | Show or toggle sniff mode (needs custom firmware, see below) |
+| `reconnect` | Reconnect after `meshlisten` gave up because another client kept taking over |
 | `reboot`, `shutdown` | Reboot or shut down the node, then quit |
 | `q`, `quit` | Quit |
 
