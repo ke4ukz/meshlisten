@@ -1,7 +1,7 @@
 from meshtastic.serial_interface import SerialInterface
 from meshtastic.tcp_interface import TCPInterface
 import meshtastic
-from meshtastic.protobuf import admin_pb2, mesh_pb2, portnums_pb2, localonly_pb2
+from meshtastic.protobuf import admin_pb2, config_pb2, mesh_pb2, portnums_pb2, localonly_pb2
 from pubsub import pub
 from datetime import datetime
 from sys import exit, stderr
@@ -427,14 +427,31 @@ def handle_admin_packet(packet, interface):
             request["pending"].discard(section)
             if not request["pending"]:
                 config_request = None
+    elif admin.HasField("get_device_metadata_response"):
+        print_device_metadata(admin.get_device_metadata_response)
     elif admin.HasField("get_device_connection_status_response"):
         print_connection_status(interface, admin.get_device_connection_status_response)
 
-def request_connection_status(interface)->None:
-    p = admin_pb2.AdminMessage()
-    p.get_device_connection_status_request = True
-    # the library has no public helper for this request, getMetadata() uses _sendAdmin the same way
-    interface.localNode._sendAdmin(p, wantResponse=True)
+def request_status(interface)->None:
+    """Ask the node for its metadata (firmware, hardware, role) and connection status"""
+    # the library has no public helpers that don't print on their own, getMetadata() uses _sendAdmin the same way
+    metadata = admin_pb2.AdminMessage()
+    metadata.get_device_metadata_request = True
+    interface.localNode._sendAdmin(metadata, wantResponse=True)
+    connection = admin_pb2.AdminMessage()
+    connection.get_device_connection_status_request = True
+    interface.localNode._sendAdmin(connection, wantResponse=True)
+
+def enum_name(enum_type, value:int)->str:
+    try:
+        return enum_type.Name(value)
+    except ValueError:
+        return str(value)  # newer firmware than this library knows about
+
+def print_device_metadata(metadata)->None:
+    print(f"firmware: {metadata.firmware_version}")
+    print(f"hardware: {enum_name(mesh_pb2.HardwareModel, metadata.hw_model)}")
+    print(f"role: {enum_name(config_pb2.Config.DeviceConfig.Role, metadata.role)}")
 
 def format_ip(ip:int)->str:
     # the firmware stores the address with the first octet in the low byte
@@ -496,7 +513,7 @@ def print_config_section(section:str, values, unredacted:bool)->None:
 
 def print_help():
     print("h help - prints this help")
-    print("status - shows the node's wifi, bluetooth and serial connection status")
+    print("status - shows the node's firmware, hardware and role, and its wifi, bluetooth and serial connection status")
     print("c config [unredacted] - prints local device config (keys, passwords and position hidden unless unredacted)")
     print("n nodes [node_id] - list nodes or shows node details")
     print("q quit - quits")
@@ -749,7 +766,7 @@ def main(args: argparse.Namespace)->int:
                     continue
                 request_config(interface, unredacted=len(cmdargs) > 0)
             elif cmd == "status":
-                request_connection_status(interface)
+                request_status(interface)
             elif cmd in ("t", "traceroute", "tracert", "trace"):
                 if len(cmdargs) == 0:
                     print("must provide a node ID in the format !xxxxxxxx")

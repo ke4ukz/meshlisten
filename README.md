@@ -49,7 +49,7 @@ node received it.
 | `t`, `traceroute <node_id>` | Send a traceroute |
 | `r`, `request <node_id>` | Request node info |
 | `c`, `config [unredacted]` | Fetch and print the connected node's config. Private key, Wi-Fi password, Bluetooth PIN and position are hidden unless `unredacted` is given |
-| `status` | Show the node's Wi-Fi, Bluetooth and serial connection status (including its IP address) |
+| `status` | Show the node's firmware version, hardware model and role, and its Wi-Fi, Bluetooth and serial connection status (including its IP address) |
 | `m`, `messages` | Browse the stored packet history (see below) |
 | `hops [n]` | Show or set the hop limit for sent messages |
 | `d`, `debug [on\|off]` | Show or toggle debug output |
