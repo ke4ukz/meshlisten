@@ -8,6 +8,7 @@ commands for sending messages, traceroutes and info requests.
 
 - Python 3.12 or newer
 - A Meshtastic node connected by USB serial
+- Standard Meshtastic firmware (only the `sniff` command needs a custom module)
 
 ```
 pip install -r requirements.txt
@@ -69,7 +70,7 @@ m show 23 --packet --raw   one packet in detail, with its JSON and protobuf
 Normally a node only passes packets to the client if they are broadcast or addressed to it. `sniff on`
 asks the node to also pass along packets addressed to other nodes that it overhears or relays.
 
-This needs a custom firmware module that listens on private port 300. It isn't part of standard
+Sniff needs a custom firmware module that listens on private port 300. It isn't part of standard
 Meshtastic firmware, and with standard firmware the command has no effect. `meshlisten` turns sniff mode
 off again when it quits.
 
