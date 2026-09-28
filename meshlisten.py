@@ -11,6 +11,7 @@ import argparse
 import base64
 import contextlib
 import json
+import logging
 import os
 import shlex
 import sqlite3
@@ -553,6 +554,27 @@ def print_dict(d, indent=0):
         else:
             print(f"{" " * indent} {k} = {v}")
 
+def timestamp()->str:
+    return f"{datetime.now():%Y-%m-%d %H:%M:%S}"
+
+def log_event(msg:str)->None:
+    """Timestamped status message, e.g. connection lost or restored"""
+    print(f"{ANSIColor.YELLOW}{timestamp()} {msg}{ANSIColor.END}")
+
+def thread_excepthook(hook_args)->None:
+    """Put a timestamp on crashes in background threads (the library's heartbeat timer, for example)"""
+    name = hook_args.thread.name if hook_args.thread else "unknown"
+    print(f"{timestamp()} unhandled error in thread {name}:", file=stderr)
+    threading.__excepthook__(hook_args)
+
+def setup_logging()->None:
+    # the meshtastic library reports problems through logging, give those timestamps too
+    logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+                        datefmt="%Y-%m-%d %H:%M:%S")
+    # TCP connects and drops, including the ones the library reconnects by itself
+    logging.getLogger("meshtastic.tcp_interface").setLevel(logging.DEBUG)
+    threading.excepthook = thread_excepthook
+
 def dbg(msg:Any)->None:
     global debug_enabled
     if (not debug_enabled):
@@ -593,7 +615,7 @@ class Connection:
 
     def _reconnect(self, old):
         target = self.args.host or self.args.port
-        print(f"{ANSIColor.YELLOW}Connection to {target} lost, reconnecting...{ANSIColor.END}")
+        log_event(f"Connection to {target} lost, reconnecting...")
         # closing the dead interface also stops its heartbeat timer
         with contextlib.suppress(Exception):
             old.close()
@@ -618,10 +640,9 @@ class Connection:
         self.interface = new
         self.reconnecting = False
         if self.reboot_count is not None and reboot_count is not None and reboot_count > self.reboot_count:
-            print(f"{ANSIColor.YELLOW}Reconnected to {target}, the node rebooted "
-                  f"(reboot count {self.reboot_count} -> {reboot_count}){ANSIColor.END}")
+            log_event(f"Reconnected to {target}, the node rebooted (reboot count {self.reboot_count} -> {reboot_count})")
         else:
-            print(f"{ANSIColor.YELLOW}Reconnected to {target}{ANSIColor.END}")
+            log_event(f"Reconnected to {target}")
         self.reboot_count = reboot_count
         if sniff_requested:
             # sniff mode lives in the node's RAM, so a reboot turned it off
@@ -635,6 +656,7 @@ class Connection:
 def main(args: argparse.Namespace)->int:
     global debug_enabled, quiet, log_admin, sniff_requested, db
 
+    setup_logging()  # inside patch_stdout, so log output also goes above the prompt
     debug_enabled = args.debug
     quiet = args.quiet
     log_admin = args.log_admin
