@@ -1,0 +1,11 @@
+# packet history database
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+__pycache__/
+*.pyc
+.venv/
+.vscode/
+.DS_Store
