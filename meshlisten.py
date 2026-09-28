@@ -9,6 +9,7 @@ from time import sleep
 from typing import Any, Tuple
 import argparse
 import base64
+import contextlib
 import json
 import os
 import shlex
@@ -558,6 +559,79 @@ def dbg(msg:Any)->None:
         return
     print(f"{ANSIColor.YELLOW}{msg}{ANSIColor.END}")
 
+# commands that talk to the node, refused while reconnecting
+NODE_COMMANDS = {"c", "settings", "config", "status", "t", "traceroute", "tracert", "trace", "s", "send",
+                 "r", "request", "sniff", "reboot", "shutdown"}
+
+def open_interface(args:argparse.Namespace):
+    if args.host:
+        return TCPInterface(args.host)
+    return SerialInterface(args.port)
+
+class Connection:
+    """Holds the current interface and replaces it when the library reports the connection lost"""
+
+    def __init__(self, args:argparse.Namespace, interface):
+        self.args = args
+        self.interface = interface
+        self.closing = False
+        self.reconnecting = False
+        self.lock = threading.Lock()
+        self.reboot_count = interface.myInfo.reboot_count if interface.myInfo else None
+        pub.subscribe(self.on_connection_lost, "meshtastic.connection.lost")
+
+    @property
+    def connected(self)->bool:
+        return not self.reconnecting and self.interface.isConnected.is_set()
+
+    def on_connection_lost(self, interface):
+        with self.lock:
+            if self.closing or self.reconnecting or interface is not self.interface:
+                return
+            self.reconnecting = True
+        threading.Thread(target=self._reconnect, args=(interface,), daemon=True).start()
+
+    def _reconnect(self, old):
+        target = self.args.host or self.args.port
+        print(f"{ANSIColor.YELLOW}Connection to {target} lost, reconnecting...{ANSIColor.END}")
+        # closing the dead interface also stops its heartbeat timer
+        with contextlib.suppress(Exception):
+            old.close()
+
+        new = None
+        delay = 2
+        while new is None and not self.closing:
+            try:
+                new = open_interface(self.args)
+            except (OSError, meshtastic.mesh_interface.MeshInterface.MeshInterfaceError) as ex:
+                dbg(f"reconnect to {target} failed ({ex}), retrying in {delay}s")
+                sleep(delay)
+                delay = min(delay * 2, 60)
+        if new is None:
+            return
+        if self.closing:
+            with contextlib.suppress(Exception):
+                new.close()
+            return
+
+        reboot_count = new.myInfo.reboot_count if new.myInfo else None
+        self.interface = new
+        self.reconnecting = False
+        if self.reboot_count is not None and reboot_count is not None and reboot_count > self.reboot_count:
+            print(f"{ANSIColor.YELLOW}Reconnected to {target}, the node rebooted "
+                  f"(reboot count {self.reboot_count} -> {reboot_count}){ANSIColor.END}")
+        else:
+            print(f"{ANSIColor.YELLOW}Reconnected to {target}{ANSIColor.END}")
+        self.reboot_count = reboot_count
+        if sniff_requested:
+            # sniff mode lives in the node's RAM, so a reboot turned it off
+            new.sendData(b"\x01", destinationId=new.localNode.nodeNum, portNum=SNIFF_PORTNUM, wantResponse=True)
+
+    def close(self):
+        self.closing = True
+        with contextlib.suppress(Exception):
+            self.interface.close()
+
 def main(args: argparse.Namespace)->int:
     global debug_enabled, quiet, log_admin, sniff_requested, db
 
@@ -595,10 +669,7 @@ def main(args: argparse.Namespace)->int:
     dbg(f"Connecting to {target}")
 
     try:
-        if args.host:
-            interface = TCPInterface(args.host)
-        else:
-            interface = SerialInterface(args.port)
+        interface = open_interface(args)
     except FileNotFoundError as ex:
         print(f"{args.port} not found on this system ({ex})", file=stderr)
         return 1
@@ -610,7 +681,8 @@ def main(args: argparse.Namespace)->int:
         print(f"failed to connect to {target}, the device may be shut down", file=stderr)
         return 1
 
-    with interface:
+    conn = Connection(args, interface)
+    try:
         dbg(f"{len(interface.nodes)} nodes currently known)")
         print("use n to list known nodes")
         print("Use ? or help for commands")
@@ -634,6 +706,11 @@ def main(args: argparse.Namespace)->int:
             cmd = cmd.lower()
             rest = rest.strip()
             cmdargs = rest.split()
+
+            interface = conn.interface  # may have been replaced by a reconnect
+            if cmd in NODE_COMMANDS and not conn.connected:
+                print("Not connected to the node right now (reconnecting), try again shortly")
+                continue
 
             if cmd in ("n", "nodes"):
                 if len(cmdargs) == 0:
@@ -776,11 +853,13 @@ def main(args: argparse.Namespace)->int:
                 continue
             else:
                 print_help()
-        if sniff_requested:
+        if sniff_requested and conn.connected:
             # sniff mode is for this script only, don't leave it on for the next client
-            interface.sendData(b"\x00", destinationId=interface.localNode.nodeNum, portNum=SNIFF_PORTNUM)
+            conn.interface.sendData(b"\x00", destinationId=conn.interface.localNode.nodeNum, portNum=SNIFF_PORTNUM)
             sleep(0.5)
         dbg("Quitting")
+    finally:
+        conn.close()
     with db_lock:
         db.close()
         db = None
